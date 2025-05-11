@@ -1,22 +1,24 @@
-package main
+package secretman
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"golang.org/x/crypto/scrypt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 type SecretStore struct {
-	Secrets map[string]string `json:"secrets"`
+	secrets map[string]string
+	key     []byte
 }
 
 const (
 	secretsFile = ".secretman/secrets.enc"
+	saltFile    = ".secretman/salt"
 )
 
 func getSecretPath() string {
@@ -25,6 +27,37 @@ func getSecretPath() string {
 		panic(err)
 	}
 	return filepath.Join(home, secretsFile)
+}
+
+func getSaltPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Join(home, saltFile)
+}
+
+func deriveKey(password string, salt []byte) ([]byte, error) {
+	return scrypt.Key([]byte(password), salt, 1<<15, 8, 1, 32)
+}
+
+func getOrCreateSalt() ([]byte, error) {
+	path := getSaltPath()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		salt := make([]byte, 16)
+		if _, err := rand.Read(salt); err != nil {
+			return nil, err
+		}
+		err = os.MkdirAll(filepath.Dir(path), 0700)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, salt, 0600); err != nil {
+			return nil, err
+		}
+		return salt, nil
+	}
+	return os.ReadFile(path)
 }
 
 func encrypt(data, key []byte) ([]byte, error) {
@@ -55,16 +88,19 @@ func decrypt(data, key []byte) ([]byte, error) {
 		return nil, err
 	}
 	nonceSize := aesGCM.NonceSize()
+	if len(data) < nonceSize {
+		return nil, errors.New("data too short")
+	}
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
 	return aesGCM.Open(nil, nonce, ciphertext, nil)
 }
 
-func loadSecrets(key []byte) (*SecretStore, error) {
+func loadSecrets(key []byte) (map[string]string, error) {
 	path := getSecretPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &SecretStore{Secrets: map[string]string{}}, nil
+			return map[string]string{}, nil
 		}
 		return nil, err
 	}
@@ -72,13 +108,13 @@ func loadSecrets(key []byte) (*SecretStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &SecretStore{}
-	err = json.Unmarshal(decrypted, store)
-	return store, err
+	secrets := map[string]string{}
+	err = json.Unmarshal(decrypted, &secrets)
+	return secrets, err
 }
 
-func saveSecrets(store *SecretStore, key []byte) error {
-	data, err := json.Marshal(store)
+func saveSecrets(secrets map[string]string, key []byte) error {
+	data, err := json.Marshal(secrets)
 	if err != nil {
 		return err
 	}
@@ -94,41 +130,45 @@ func saveSecrets(store *SecretStore, key []byte) error {
 	return os.WriteFile(path, encrypted, 0600)
 }
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: secretman [set|get|list|delete] key=value")
-		os.Exit(1)
-	}
-
-	key := []byte(strings.Repeat("m", 32)) // In real app, derive from password
-	command := os.Args[1]
-	store, err := loadSecrets(key)
+func Init(password string) (*SecretStore, error) {
+	salt, err := getOrCreateSalt()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-
-	switch command {
-	case "set":
-		if len(os.Args) < 3 {
-			fmt.Println("Provide key=value")
-			return
-		}
-		parts := strings.SplitN(os.Args[2], "=", 2)
-		store.Secrets[parts[0]] = parts[1]
-		err = saveSecrets(store, key)
-	case "get":
-		fmt.Println(store.Secrets[os.Args[2]])
-	case "list":
-		for k := range store.Secrets {
-			fmt.Println(k)
-		}
-	case "delete":
-		delete(store.Secrets, os.Args[2])
-		err = saveSecrets(store, key)
-	default:
-		fmt.Println("Unknown command")
-	}
+	key, err := deriveKey(password, salt)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
+	secrets, err := loadSecrets(key)
+	if err != nil {
+		return nil, err
+	}
+	return &SecretStore{secrets: secrets, key: key}, nil
+}
+
+func (s *SecretStore) Get(key string) string {
+	return s.secrets[key]
+}
+
+func (s *SecretStore) Set(key, value string) error {
+	s.secrets[key] = value
+	return saveSecrets(s.secrets, s.key)
+}
+
+func (s *SecretStore) Delete(key string) error {
+	delete(s.secrets, key)
+	return saveSecrets(s.secrets, s.key)
+}
+
+func (s *SecretStore) ListKeys() []string {
+	keys := make([]string, 0, len(s.secrets))
+	for k := range s.secrets {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (s *SecretStore) AsJSON() (string, error) {
+	b, err := json.MarshalIndent(s.secrets, "", "  ")
+	return string(b), err
 }
